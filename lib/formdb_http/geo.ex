@@ -29,7 +29,7 @@ defmodule FormdbHttp.Geo do
   @spec insert_feature(reference(), geometry(), map(), map()) ::
           {:ok, %{feature_id: String.t(), block_id: binary()}} | {:error, term()}
   def insert_feature(db_handle, geometry, properties, provenance) do
-    alias FormdbHttp.{FormDB, CBOR}
+    alias FormdbHttp.{FormDB, CBOR, SpatialIndex, QueryCache}
 
     # Generate unique feature ID
     feature_id = generate_feature_id()
@@ -52,9 +52,50 @@ defmodule FormdbHttp.Geo do
                FormDB.apply_operation(txn, cbor_data)
              end) do
           {:ok, {:ok, block_id}} ->
+            # Update spatial index
+            case extract_bbox(geometry) do
+              {:ok, bbox} ->
+                db_id = extract_db_id(db_handle)
+                SpatialIndex.insert(db_id, feature_id, bbox)
+
+              :error ->
+                :ok
+            end
+
+            # Invalidate query cache for this database
+            db_id = extract_db_id(db_handle)
+            QueryCache.invalidate_db(db_id)
+
+            # Publish to PubSub for real-time subscribers
+            Phoenix.PubSub.broadcast(
+              FormdbHttp.PubSub,
+              "journal:#{db_id}",
+              {:journal_event, feature}
+            )
+
             {:ok, %{feature_id: feature_id, block_id: block_id}}
 
           {:ok, block_id} when is_binary(block_id) ->
+            # Update spatial index
+            case extract_bbox(geometry) do
+              {:ok, bbox} ->
+                db_id = extract_db_id(db_handle)
+                SpatialIndex.insert(db_id, feature_id, bbox)
+
+              :error ->
+                :ok
+            end
+
+            # Invalidate cache and publish event
+            db_id = extract_db_id(db_handle)
+            QueryCache.invalidate_db(db_id)
+
+            Phoenix.PubSub.broadcast(
+              FormdbHttp.PubSub,
+              "journal:#{db_id}",
+              {:journal_event, feature}
+            )
+
             {:ok, %{feature_id: feature_id, block_id: block_id}}
 
           {:error, reason} ->
@@ -72,11 +113,56 @@ defmodule FormdbHttp.Geo do
   """
   @spec query_by_bbox(reference(), bbox(), map()) ::
           {:ok, map()} | {:error, term()}
-  def query_by_bbox(db_handle, {minx, miny, maxx, maxy}, filters) do
-    alias FormdbHttp.{FormDB, CBOR}
+  def query_by_bbox(db_handle, {minx, miny, maxx, maxy} = bbox, filters) do
+    alias FormdbHttp.{FormDB, CBOR, SpatialIndex, QueryCache}
 
-    # M12: Linear scan through journal (no spatial index yet)
-    # M13+: Use R-tree spatial index for efficient queries
+    db_id = extract_db_id(db_handle)
+    limit = Map.get(filters, :limit, 100)
+
+    # Generate cache key
+    cache_key = QueryCache.query_key(db_id, :geo_bbox, %{bbox: bbox, limit: limit})
+
+    # Check cache first
+    case QueryCache.get(cache_key) do
+      {:ok, cached_result} ->
+        {:ok, cached_result}
+
+      :miss ->
+        # Use spatial index if available
+        result =
+          case SpatialIndex.query(db_id, bbox) do
+            {:ok, feature_ids} when length(feature_ids) > 0 ->
+              # M13: Use spatial index to get feature IDs, then fetch features
+              features = fetch_features_by_ids(db_handle, feature_ids, limit)
+
+              %{
+                type: "FeatureCollection",
+                bbox: [minx, miny, maxx, maxy],
+                features: features
+              }
+
+            {:ok, []} ->
+              # Index returned no results
+              %{
+                type: "FeatureCollection",
+                bbox: [minx, miny, maxx, maxy],
+                features: []
+              }
+
+            {:error, :index_not_found} ->
+              # Fall back to linear scan (M12 behavior)
+              linear_scan_bbox(db_handle, bbox, limit)
+          end
+
+        # Cache the result
+        QueryCache.put(cache_key, result)
+
+        {:ok, result}
+    end
+  end
+
+  defp linear_scan_bbox(db_handle, {minx, miny, maxx, maxy} = bbox, limit) do
+    alias FormdbHttp.{FormDB, CBOR}
 
     case FormDB.get_journal(db_handle, 0) do
       {:ok, journal_cbor} ->
@@ -85,8 +171,8 @@ defmodule FormdbHttp.Geo do
             {:ok, journal_entries} when is_list(journal_entries) ->
               journal_entries
               |> Enum.filter(&is_feature?/1)
-              |> Enum.filter(&bbox_intersects?(&1, {minx, miny, maxx, maxy}))
-              |> Enum.take(Map.get(filters, :limit, 100))
+              |> Enum.filter(&bbox_intersects?(&1, bbox))
+              |> Enum.take(limit)
 
             {:ok, _} ->
               []
@@ -95,15 +181,43 @@ defmodule FormdbHttp.Geo do
               []
           end
 
-        {:ok,
-         %{
-           type: "FeatureCollection",
-           bbox: [minx, miny, maxx, maxy],
-           features: features
-         }}
+        %{
+          type: "FeatureCollection",
+          bbox: [minx, miny, maxx, maxy],
+          features: features
+        }
 
-      {:error, reason} ->
-        {:error, reason}
+      {:error, _} ->
+        %{
+          type: "FeatureCollection",
+          bbox: [minx, miny, maxx, maxy],
+          features: []
+        }
+    end
+  end
+
+  defp fetch_features_by_ids(db_handle, feature_ids, limit) do
+    alias FormdbHttp.{FormDB, CBOR}
+
+    # Fetch journal and filter by IDs
+    case FormDB.get_journal(db_handle, 0) do
+      {:ok, journal_cbor} ->
+        case CBOR.decode(journal_cbor) do
+          {:ok, journal_entries} when is_list(journal_entries) ->
+            id_set = MapSet.new(feature_ids)
+
+            journal_entries
+            |> Enum.filter(fn entry ->
+              is_feature?(entry) and MapSet.member?(id_set, Map.get(entry, "id"))
+            end)
+            |> Enum.take(limit)
+
+          _ ->
+            []
+        end
+
+      _ ->
+        []
     end
   end
 
@@ -248,4 +362,12 @@ defmodule FormdbHttp.Geo do
         :error
     end
   end
+
+  defp extract_db_id(db_handle) when is_reference(db_handle) do
+    # Extract database ID from handle reference
+    # For M13 PoC, use inspect to get a stable ID
+    inspect(db_handle)
+  end
+
+  defp extract_db_id(_), do: "unknown"
 end

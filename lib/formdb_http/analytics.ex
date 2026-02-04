@@ -24,10 +24,11 @@ defmodule FormdbHttp.Analytics do
   @spec insert_timeseries(reference(), String.t(), DateTime.t(), float(), map(), map()) ::
           {:ok, %{point_id: String.t(), block_id: binary()}} | {:error, term()}
   def insert_timeseries(db_handle, series_id, timestamp, value, metadata, provenance) do
-    alias FormdbHttp.{FormDB, CBOR}
+    alias FormdbHttp.{FormDB, CBOR, TemporalIndex, QueryCache}
 
     # Generate unique point ID
     point_id = generate_point_id()
+    timestamp_unix = DateTime.to_unix(timestamp, :second)
 
     # Create time-series point
     point = %{
@@ -35,7 +36,7 @@ defmodule FormdbHttp.Analytics do
       id: point_id,
       series_id: series_id,
       timestamp: DateTime.to_iso8601(timestamp),
-      timestamp_unix: DateTime.to_unix(timestamp, :second),
+      timestamp_unix: timestamp_unix,
       value: value,
       metadata: metadata,
       provenance: provenance,
@@ -50,9 +51,36 @@ defmodule FormdbHttp.Analytics do
                FormDB.apply_operation(txn, cbor_data)
              end) do
           {:ok, {:ok, block_id}} ->
+            # Update temporal index
+            db_id = extract_db_id(db_handle)
+            TemporalIndex.insert(db_id, series_id, point_id, timestamp_unix)
+
+            # Invalidate query cache
+            QueryCache.invalidate_db(db_id)
+
+            # Publish to PubSub for real-time subscribers
+            Phoenix.PubSub.broadcast(
+              FormdbHttp.PubSub,
+              "journal:#{db_id}",
+              {:journal_event, point}
+            )
+
             {:ok, %{point_id: point_id, block_id: block_id}}
 
           {:ok, block_id} when is_binary(block_id) ->
+            # Update temporal index
+            db_id = extract_db_id(db_handle)
+            TemporalIndex.insert(db_id, series_id, point_id, timestamp_unix)
+
+            # Invalidate cache and publish event
+            QueryCache.invalidate_db(db_id)
+
+            Phoenix.PubSub.broadcast(
+              FormdbHttp.PubSub,
+              "journal:#{db_id}",
+              {:journal_event, point}
+            )
+
             {:ok, %{point_id: point_id, block_id: block_id}}
 
           {:error, reason} ->
@@ -64,36 +92,55 @@ defmodule FormdbHttp.Analytics do
     end
   end
 
+  defp extract_db_id(db_handle) when is_reference(db_handle) do
+    # Extract database ID from handle reference
+    inspect(db_handle)
+  end
+
+  defp extract_db_id(_), do: "unknown"
+
   @doc """
   Query time-series data with optional aggregation.
   """
   @spec query_timeseries(reference(), String.t(), DateTime.t(), DateTime.t(), aggregation(), interval() | nil, integer()) ::
           {:ok, map()} | {:error, term()}
   def query_timeseries(db_handle, series_id, start_time, end_time, aggregation, interval, limit) do
-    alias FormdbHttp.{FormDB, CBOR}
+    alias FormdbHttp.{FormDB, CBOR, TemporalIndex, QueryCache}
 
-    # M12: Linear scan through journal (no time-series index yet)
-    # M13+: Use B-tree index on timestamps for efficient queries
-
+    db_id = extract_db_id(db_handle)
     start_unix = DateTime.to_unix(start_time, :second)
     end_unix = DateTime.to_unix(end_time, :second)
 
-    case FormDB.get_journal(db_handle, 0) do
-      {:ok, journal_cbor} ->
+    # Generate cache key
+    cache_key = QueryCache.query_key(db_id, :timeseries, %{
+      series_id: series_id,
+      start: start_unix,
+      end: end_unix,
+      aggregation: aggregation,
+      interval: interval,
+      limit: limit
+    })
+
+    # Check cache first
+    case QueryCache.get(cache_key) do
+      {:ok, cached_result} ->
+        {:ok, cached_result}
+
+      :miss ->
+        # Use temporal index if available
         points =
-          case CBOR.decode(journal_cbor) do
-            {:ok, journal_entries} when is_list(journal_entries) ->
-              journal_entries
-              |> Enum.filter(&is_timeseries_point?/1)
-              |> Enum.filter(&matches_series?(&1, series_id))
-              |> Enum.filter(&in_time_range?(&1, start_unix, end_unix))
-              |> Enum.take(limit)
+          case TemporalIndex.range_query(db_id, series_id, start_unix, end_unix, limit) do
+            {:ok, point_ids} when length(point_ids) > 0 ->
+              # M13: Use temporal index to get point IDs, then fetch points
+              fetch_points_by_ids(db_handle, series_id, point_ids)
 
-            {:ok, _} ->
+            {:ok, []} ->
+              # Index returned no results
               []
 
-            {:error, _} ->
-              []
+            {:error, :index_not_found} ->
+              # Fall back to linear scan (M12 behavior)
+              linear_scan_timeseries(db_handle, series_id, start_unix, end_unix, limit)
           end
 
         # Apply aggregation if requested
@@ -120,10 +167,10 @@ defmodule FormdbHttp.Analytics do
           data: data
         }
 
-        {:ok, result}
+        # Cache the result
+        QueryCache.put(cache_key, result)
 
-      {:error, reason} ->
-        {:error, reason}
+        {:ok, result}
     end
   end
 
@@ -264,5 +311,56 @@ defmodule FormdbHttp.Analytics do
       DateTime.add(start_time, bucket_index * interval_seconds, :second)
     end)
     |> Enum.sort_by(fn {bucket_start, _} -> DateTime.to_unix(bucket_start, :second) end)
+  end
+
+  defp linear_scan_timeseries(db_handle, series_id, start_unix, end_unix, limit) do
+    alias FormdbHttp.{FormDB, CBOR}
+
+    case FormDB.get_journal(db_handle, 0) do
+      {:ok, journal_cbor} ->
+        case CBOR.decode(journal_cbor) do
+          {:ok, journal_entries} when is_list(journal_entries) ->
+            journal_entries
+            |> Enum.filter(&is_timeseries_point?/1)
+            |> Enum.filter(&matches_series?(&1, series_id))
+            |> Enum.filter(&in_time_range?(&1, start_unix, end_unix))
+            |> Enum.take(limit)
+
+          {:ok, _} ->
+            []
+
+          {:error, _} ->
+            []
+        end
+
+      {:error, _} ->
+        []
+    end
+  end
+
+  defp fetch_points_by_ids(db_handle, series_id, point_ids) do
+    alias FormdbHttp.{FormDB, CBOR}
+
+    # Fetch journal and filter by IDs
+    case FormDB.get_journal(db_handle, 0) do
+      {:ok, journal_cbor} ->
+        case CBOR.decode(journal_cbor) do
+          {:ok, journal_entries} when is_list(journal_entries) ->
+            id_set = MapSet.new(point_ids)
+
+            journal_entries
+            |> Enum.filter(fn entry ->
+              is_timeseries_point?(entry) and
+                matches_series?(entry, series_id) and
+                MapSet.member?(id_set, Map.get(entry, "id"))
+            end)
+
+          _ ->
+            []
+        end
+
+      _ ->
+        []
+    end
   end
 end

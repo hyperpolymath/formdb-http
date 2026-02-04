@@ -15,6 +15,12 @@ defmodule FormdbHttp.Application do
       FormdbHttpWeb.Metrics.Collector,
       # Graceful shutdown handler
       FormdbHttp.GracefulShutdown,
+      # M13: Spatial index for geospatial queries
+      FormdbHttp.SpatialIndex,
+      # M13: Temporal index for time-series queries
+      FormdbHttp.TemporalIndex,
+      # M13: Query result cache
+      FormdbHttp.QueryCache,
       # Start a worker by calling: FormdbHttp.Worker.start_link(arg)
       # {FormdbHttp.Worker, arg},
       # Start to serve requests, typically the last entry
